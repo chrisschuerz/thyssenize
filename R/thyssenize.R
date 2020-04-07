@@ -10,40 +10,48 @@
 #' @return Returns a tibble holding dates, shape_id, and averaged values
 #'
 #' @importFrom doSNOW registerDoSNOW
-#' @importFrom dplyr %>% bind_rows
+#' @importFrom dplyr %>% bind_rows select
 #' @importFrom foreach foreach %dopar%
 #' @importFrom lubridate now
 #' @importFrom parallel detectCores makeCluster stopCluster
+#' @importFrom purrr set_names
 #' @importFrom sf st_sfc
 #'
+#' @export
+#'
 thyssenize <- function(station_data, location, shape, shape_id, dates, cores = NULL) {
+  var_name <- names(station_data)[3]
+  names(station_data) <- c("date", "stat_id", "value")
+  names(location) <- c("stat_id", "geometry")
+  shape <- select(shape, !!shape_id) %>% set_names(c("shape_id", "geometry"))
 
   loc_bbox <- st_sfc(bbox_polygon(location))
-  cores <- min(cores,detectCores())
 
+  n_t <- length(dates)
+  cores <- min(cores, detectCores(), n_t)
   cl <- makeCluster(cores)
   registerDoSNOW(cl)
+
   t0 <- now()
   progress <- function(n){
     display_progress(n, n_t, t0,  "Progress:")
   }
   opts <- list(progress = progress)
 
-  n_t <- length(dates)
-
-  thys_list <- foreach(t_i = 1:n_t,
-                       .packages = c("tibble", "purrr", "dplyr", "lubridate", "sf"),
-                       .options.snow = opts) %dopar% {
+  thys_list <- foreach(t_i = 1:n_t, .options.snow = opts) %dopar% {
                          thys_i <- thyssen_i(station_data = station_data,
                                              location = location,
                                              shape = shape,
                                              bbox_sf = loc_bbox,
-                                             date_i = dates[n_t])
+                                             date_i = dates[t_i])
                          return(thys_i)
                        }
 
   stopCluster(cl)
-  thys <- bind_rows(thys_list)
+
+  thys <- bind_rows(thys_list) %>%
+    set_names(c("date",shape_id, var_name))
+
   return(thys)
 }
 
@@ -56,16 +64,14 @@ thyssenize <- function(station_data, location, shape, shape_id, dates, cores = N
 #' @param bbox_sf bounding box sf object.
 #' @param date_i Lubridate ymd format date defining the date for which the average values are calculated.
 #'
-#' @importFrom doSNOW registerDoSNOW
-#' @importFrom dplyr %>% bind_rows
-#' @importFrom foreach foreach %dopar%
-#' @importFrom lubridate now
-#' @importFrom parallel detectCores makeCluster stopCluster
-#' @importFrom sf st_sfc
+#' @importFrom dplyr %>% arrange filter group_by left_join mutate select summarise
+#' @importFrom purrr map_dbl set_names
+#' @importFrom sf st_area st_cast st_centroid st_distance st_intersection st_sf st_union st_voronoi
+#' @importFrom tibble as_tibble add_column
 #'
-thyssen_i <- function(station_data, location, shape, shape_id, bbox_sf, date_i) {
-  var_i <- station_data %>% filter(date == date_i) %>% filter(!is.na(value))
-  loc_i <- filter(location, stat_nr %in% var_i$stat_nr)
+thyssen_i <- function(station_data, location, shape, bbox_sf, date_i) {
+  data_i <- station_data %>% filter(date == date_i) %>% filter(!is.na(value))
+  loc_i <- filter(location, stat_id %in% data_i$stat_id)
 
   center_i <- suppressWarnings(st_centroid(loc_i))
   thys_i <- st_voronoi(st_union(loc_i), bbox_sf) %>%
@@ -74,22 +80,22 @@ thyssen_i <- function(station_data, location, shape, shape_id, bbox_sf, date_i) 
   stat_order_i <- st_distance(thys_i, loc_i) %>%
     as_tibble(.) %>%
     map_dbl(., which.min) %>%
-    set_names(., loc_i$stat_nr)
+    set_names(., loc_i$stat_id)
 
-  thys_i <- st_sf(stat_nr = names(sort(stat_order_i)), geom = thys_i) %>%
-    mutate(stat_nr = as.numeric(as.character(stat_nr)))
+  thys_i <- st_sf(stat_id = names(sort(stat_order_i)), geom = thys_i) %>%
+    mutate(stat_id = as.numeric(as.character(stat_id)))
   sub_thys_i <- suppressWarnings(st_intersection(shape, thys_i))
 
   sub_val_i <- sub_thys_i %>%
     mutate(area = st_area(geometry) %>% as.numeric(.)) %>%
-    group_by(Subbasin) %>%
+    group_by(shape_id) %>%
     mutate(area_frct = area / sum(area)) %>%
-    arrange(Subbasin) %>%
-    as_data_frame(.) %>%
-    select(Subbasin, stat_nr, area_frct) %>%
-    left_join(., var_i, by = "stat_nr") %>%
+    arrange(shape_id) %>%
+    as_tibble(.) %>%
+    select(shape_id, stat_id, area_frct) %>%
+    left_join(., data_i, by = "stat_id") %>%
     mutate(value = value*area_frct) %>%
-    group_by(Subbasin) %>%
+    group_by(shape_id) %>%
     summarise(value = sum(value)) %>%
     add_column(date = date_i, .before = 1)
 
